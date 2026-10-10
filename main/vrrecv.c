@@ -125,9 +125,7 @@ static void espnow_receive_cb(const esp_now_recv_info_t *info,
          data[0] == TRACKER_PACKET_ID_QUATERNION) ||
         (data_len == (int)TRACKER_CALIBRATION_STATUS_SIZE &&
          data[0] == TRACKER_PACKET_ID_CALIBRATION_STATUS) ||
-        (data_len == (int)MAG_SAMPLE_SIZE && data[0] == MAG_PACKET_SAMPLE) ||
-        (data_len == (int)TRACKER_CALIBRATION_MAP_REPORT_SIZE &&
-         data[0] == TRACKER_PACKET_ID_CALIBRATION_MAP_REPORT);
+        (data_len == (int)MAG_SAMPLE_SIZE && data[0] == MAG_PACKET_SAMPLE);
     if (!recognized) return;
 
     receiver_event_t event = {.payload_size = (size_t)data_len};
@@ -239,21 +237,6 @@ static void process_receiver_event(receiver_session_t *session,
             payload[0] = (uint8_t)slot;
             memcpy(&payload[1], event->payload, MAG_SAMPLE_SIZE);
             write_usb_frame(FUSION_MAG_SAMPLE, payload, sizeof(payload));
-        }
-        return;
-    }
-
-    if (event->payload[0] == TRACKER_PACKET_ID_CALIBRATION_MAP_REPORT) {
-        tracker_calibration_map_report_t report;
-        if (!tracker_calibration_map_report_decode(event->payload, event->payload_size, &report)) return;
-        size_t slot;
-        if (!receiver_session_assign_sender(session, event->sender_mac, &slot)) return;
-        (void)ensure_peer(event->sender_mac);
-        if (!diagnostic_mode) {
-            uint8_t payload[1 + TRACKER_CALIBRATION_MAP_REPORT_SIZE];
-            payload[0] = (uint8_t)slot;
-            memcpy(&payload[1], event->payload, event->payload_size);
-            write_usb_frame(FUSION_CALIBRATION_MAP_REPORT, payload, sizeof(payload));
         }
         return;
     }

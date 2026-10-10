@@ -154,10 +154,7 @@ def require_saved_calibration(port: object, slot: int, request_id: int, timeout:
     print("Waiting for the selected controller's saved calibration...", flush=True)
     while time.monotonic() < deadline:
         client.send(ACTION_QUERY)
-        statuses = client.statuses(1)
-        if client.protocol_mismatch:
-            raise RuntimeError("Old calibration protocol; flash both updated firmwares supporting v2.")
-        for status in statuses:
+        for status in client.statuses(1):
             if status.request_id != request_id or status.result == RESULT_UNAVAILABLE:
                 continue
             if status.result != 0:
@@ -167,7 +164,7 @@ def require_saved_calibration(port: object, slot: int, request_id: int, timeout:
             if not status.flags & 1:
                 raise RuntimeError("No saved calibration; run calibrate_controller.py first.")
             return
-    raise TimeoutError("Selected slot unavailable. Remove the diagnostic jumper, check power, and flash both updated firmwares supporting calibration v2.")
+    raise TimeoutError("Selected slot unavailable. Remove the diagnostic jumper and check receiver/controller power.")
 
 
 def run_measurement(port: object, slot: int, duration: int, request_id: int) -> int:
