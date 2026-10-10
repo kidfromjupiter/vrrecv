@@ -17,10 +17,12 @@ FRAME_SIZE = 31
 PAYLOAD_CAPACITY = 24
 FRAME_CALIBRATION_COMMAND = 0x80
 FRAME_CALIBRATION_STATUS = 0x81
+FRAME_CALIBRATION_MAP_REPORT = 0x84
 
 PACKET_CALIBRATION_COMMAND = 2
 PACKET_CALIBRATION_STATUS = 3
-PACKET_VERSION = 1
+PACKET_VERSION = 2
+PACKET_CALIBRATION_MAP_REPORT = 6
 
 ACTION_QUERY = 1
 ACTION_START_FULL = 2
@@ -53,15 +55,20 @@ STAGE_CANCELLED = 20
 RESULT_OK = 1
 RESULT_UNAVAILABLE = 11
 STATUS_CAN_FINISH = 0x02
+STATUS_HAS_CALIBRATION = 0x01
+STATUS_HAS_MAPS = 0x04
+STAGE_WAIT_CORNER_0 = 21
+STAGE_CAPTURE_CORNER_0 = 22
+STAGE_LAST = 36
 
 WAIT_PROMPTS = {
     STAGE_WAIT_STILL: "Keep the controller completely still on a stable surface.",
-    STAGE_WAIT_POS_X: "Place the controller with MPU +X upward.",
-    STAGE_WAIT_NEG_X: "Place the controller with MPU -X upward.",
-    STAGE_WAIT_POS_Y: "Place the controller with MPU +Y upward.",
-    STAGE_WAIT_NEG_Y: "Place the controller with MPU -Y upward.",
-    STAGE_WAIT_POS_Z: "Place the controller with MPU +Z upward.",
-    STAGE_WAIT_NEG_Z: "Place the controller with MPU -Z upward.",
+    STAGE_WAIT_POS_X: "Point the controller's right (+X) direction upward; hold still.",
+    STAGE_WAIT_NEG_X: "Point the controller's left (-X) direction upward; hold still.",
+    STAGE_WAIT_POS_Y: "Point the controller's front (+Y) direction upward; hold still.",
+    STAGE_WAIT_NEG_Y: "Point the controller's back (-Y) direction upward; hold still.",
+    STAGE_WAIT_POS_Z: "Point the controller's top (+Z) direction upward; hold still.",
+    STAGE_WAIT_NEG_Z: "Point the controller's bottom (-Z) direction upward; hold still.",
     STAGE_WAIT_MAG: "Prepare to move the controller through broad figure-eights in every orientation.",
 }
 
@@ -91,7 +98,24 @@ RESULT_NAMES = {
     11: "controller slot unavailable",
     12: "operation timed out",
     13: "ESP-NOW transport failed",
+    14: "invalid axis map: check the six physical face poses and right-handed body directions",
+    15: "ambiguous magnetometer alignment: repeat calibration and vary the front's compass direction between holds",
+    16: "poor magnetometer alignment: keep still and away from changing magnetic fields, then repeat calibration",
 }
+
+
+# A separate stage for each corner prevents a repeated confirmation advancing two holds.
+for corner in range(8):
+    names = [negative if corner & (1 << axis) else positive
+             for axis, (positive, negative) in enumerate(
+                 (("right", "left"), ("front", "back"), ("top", "bottom")))]
+    label = "/".join(names)
+    WAIT_PROMPTS[STAGE_WAIT_CORNER_0 + 2 * corner] = (
+        f"Point the {label} corner upward: tilt so those three body directions "
+        "point equally upward. Hold still near the same location. "
+        "Vary the front's compass direction between holds."
+    )
+    CAPTURE_NAMES[STAGE_CAPTURE_CORNER_0 + 2 * corner] = f"Capturing {label} alignment hold"
 
 
 def crc16_ccitt(data: bytes | bytearray) -> int:
@@ -166,6 +190,49 @@ class CalibrationStatus:
     sample_count: int
 
 
+@dataclass(frozen=True)
+class CalibrationMapReport:
+    slot: int
+    request_id: int
+    imu_axis_map: tuple[int, int, int]
+    mag_axis_map: tuple[int, int, int]
+    flags: int
+
+
+def valid_axis_map(values: tuple[int, int, int]) -> bool:
+    axes = tuple(abs(value) for value in values)
+    if sorted(axes) != [1, 2, 3]:
+        return False
+    determinant = -1 if sum(value < 0 for value in values) % 2 else 1
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if axes[i] > axes[j]:
+                determinant *= -1
+    return determinant == 1
+
+
+def decode_map_report(payload: bytes) -> CalibrationMapReport | None:
+    if (len(payload) != 13 or payload[0] not in (0, 1) or
+            payload[1:3] != bytes([PACKET_CALIBRATION_MAP_REPORT, PACKET_VERSION]) or
+            payload[12] != 0):
+        return None
+    request_id, *values = struct.unpack_from("<H6bB", payload, 3)
+    imu, mag, flags = tuple(values[:3]), tuple(values[3:6]), values[6]
+    if not valid_axis_map(imu) or not valid_axis_map(mag) or flags & ~5 or not flags & 1:
+        return None
+    return CalibrationMapReport(payload[0], request_id, imu, mag, flags)
+
+
+def print_map_report(report: CalibrationMapReport) -> None:
+    def describe(values):
+        return ", ".join(f"{body}<-{'+' if value > 0 else '-'}{'XYZ'[abs(value)-1]}"
+                         for body, value in zip("XYZ", values))
+    source = "learned" if report.flags & STATUS_HAS_MAPS else "legacy configured"
+    print(f"Saved {source} maps (body <- sensor):")
+    print(f"  MPU: {describe(report.imu_axis_map)}")
+    print(f"  Magnetometer: {describe(report.mag_axis_map)}")
+
+
 def encode_command(slot: int, action: int, expected_stage: int, request_id: int) -> bytes:
     packet = struct.pack(
         "<BBBBH2x",
@@ -179,16 +246,16 @@ def encode_command(slot: int, action: int, expected_stage: int, request_id: int)
 
 
 def decode_status(payload: bytes) -> CalibrationStatus | None:
-    if len(payload) != 13 or payload[1:3] != bytes(
+    if len(payload) != 13 or payload[0] not in (0, 1) or payload[1:3] != bytes(
         [PACKET_CALIBRATION_STATUS, PACKET_VERSION]
     ):
         return None
     stage, result, flags, elapsed, request_id, samples = struct.unpack_from(
         "<BBBBHH", payload, 3
     )
-    return CalibrationStatus(
-        payload[0], stage, result, flags, elapsed, request_id, samples
-    )
+    if stage > STAGE_LAST or result > 16 or flags & ~7:
+        return None
+    return CalibrationStatus(payload[0], stage, result, flags, elapsed, request_id, samples)
 
 
 class CalibrationClient:
@@ -198,6 +265,8 @@ class CalibrationClient:
         self.request_id = request_id
         self.parser = FrameParser()
         self.current_stage = STAGE_IDLE
+        self.map_reports: dict[int, CalibrationMapReport] = {}
+        self.protocol_mismatch = False
 
     def send(self, action: int, expected_stage: int = STAGE_IDLE) -> None:
         self.port.write(encode_command(self.slot, action, expected_stage, self.request_id))
@@ -209,12 +278,37 @@ class CalibrationClient:
         while time.monotonic() < deadline and not found:
             data = self.port.read(max(1, min(getattr(self.port, "in_waiting", 0), 4096)))
             for frame_type, payload in self.parser.feed(data):
+                if frame_type == FRAME_CALIBRATION_MAP_REPORT:
+                    report = decode_map_report(payload)
+                    if report is not None and report.slot == self.slot:
+                        self.map_reports[report.request_id] = report
+                    continue
                 if frame_type != FRAME_CALIBRATION_STATUS:
                     continue
+                if len(payload) >= 3 and payload[0] == self.slot and payload[2] != PACKET_VERSION:
+                    self.protocol_mismatch = True
                 status = decode_status(payload)
                 if status is not None and status.slot == self.slot:
                     found.append(status)
         return found
+
+    def read_map_report(self, timeout: float = 5.0) -> CalibrationMapReport:
+        # Use a different request ID to distinguish this fresh query from earlier reports.
+        query_id = self.request_id % 0xFFFF + 1
+        self.map_reports.pop(query_id, None)
+        deadline = time.monotonic() + timeout
+        next_query = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_query:
+                self.port.write(encode_command(self.slot, ACTION_QUERY, STAGE_IDLE, query_id))
+                self.port.flush()
+                next_query = now + 1
+            self.statuses(0.25)
+            report = self.map_reports.get(query_id)
+            if report is not None:
+                return report
+        raise TimeoutError("saved axis-map report unavailable; flash matching controller and receiver firmware")
 
     def wait_for_change(self, stage: int, action: int, timeout: float = 12.0) -> CalibrationStatus:
         deadline = time.monotonic() + timeout
@@ -263,17 +357,28 @@ def discover(client: CalibrationClient, timeout: float) -> None:
     print("Waiting for the selected controller slot...", flush=True)
     while time.monotonic() < deadline:
         client.send(ACTION_QUERY)
-        for status in client.statuses(1.0):
+        statuses = client.statuses(1.0)
+        if client.protocol_mismatch:
+            raise RuntimeError("old calibration protocol: flash both controller and receiver firmware supporting v2")
+        for status in statuses:
             if status.request_id != client.request_id:
                 continue
-            if status.result != RESULT_UNAVAILABLE:
-                return
-    raise TimeoutError("selected controller was not discovered")
+            if status.result == RESULT_UNAVAILABLE:
+                continue
+            if status.result not in (0, RESULT_OK):
+                raise RuntimeError(RESULT_NAMES.get(status.result, "controller query failed"))
+            if status.stage not in (STAGE_IDLE, STAGE_COMPLETE):
+                raise RuntimeError("controller is already calibrating")
+            if status.flags & STATUS_HAS_CALIBRATION and not status.flags & STATUS_HAS_MAPS:
+                print("Legacy calibration uses configured maps; this wizard will learn both maps.")
+            return
+    raise TimeoutError("selected controller was not discovered: remove the diagnostic jumper and flash both firmwares supporting calibration protocol v2")
 
 
 def run_calibration(client: CalibrationClient) -> int:
     status = client.wait_for_change(STAGE_IDLE, ACTION_START_FULL)
-    last_capture = -1
+    last_capture_stage = -1
+    last_mag_elapsed = -1
     finish_requested = False
     mag_hint_shown = False
 
@@ -281,6 +386,7 @@ def run_calibration(client: CalibrationClient) -> int:
         client.current_stage = status.stage
         if status.stage == STAGE_COMPLETE and status.result == RESULT_OK:
             print("Calibration saved successfully.")
+            print_map_report(client.read_map_report())
             return 0
         if status.stage in (STAGE_FAILED, STAGE_CANCELLED):
             reason = RESULT_NAMES.get(status.result, f"error {status.result}")
@@ -294,13 +400,13 @@ def run_calibration(client: CalibrationClient) -> int:
             continue
 
         if status.stage == STAGE_CAPTURE_MAG:
-            if status.elapsed_seconds != last_capture:
+            if status.elapsed_seconds != last_mag_elapsed:
                 print(
                     f"Magnetometer: {status.elapsed_seconds:2d}s, "
                     f"{status.sample_count} samples",
                     flush=True,
                 )
-                last_capture = status.elapsed_seconds
+                last_mag_elapsed = status.elapsed_seconds
             if not mag_hint_shown and status.flags & STATUS_CAN_FINISH:
                 print("Press Enter to finish early, or keep moving for 30 seconds.")
                 mag_hint_shown = True
@@ -317,9 +423,9 @@ def run_calibration(client: CalibrationClient) -> int:
             continue
 
         name = CAPTURE_NAMES.get(status.stage)
-        if name is not None and status.stage != last_capture:
+        if name is not None and status.stage != last_capture_stage:
             print(f"{name}...", flush=True)
-            last_capture = status.stage
+            last_capture_stage = status.stage
         status = client.wait_next(timeout=45.0 if status.stage == STAGE_SAVING else 15.0)
 
 
@@ -342,16 +448,21 @@ def main() -> int:
     client = CalibrationClient(port, slot, request_id)
     try:
         discover(client, args.discovery_timeout)
+        print("Body axes: +X right, +Y front, +Z top. Mounting must be aligned at 90-degree increments.")
         print(f"Starting full calibration for the {args.slot} controller.")
         return run_calibration(client)
     except KeyboardInterrupt:
-        print("\nCancelling calibration...", file=sys.stderr)
-        client.send(ACTION_CANCEL, client.current_stage)
-        client.statuses(1.0)
+        if client.current_stage == STAGE_COMPLETE:
+            print("\nCalibration is saved; report retrieval interrupted.", file=sys.stderr)
+        else:
+            print("\nCancelling calibration...", file=sys.stderr)
+            client.send(ACTION_CANCEL, client.current_stage)
+            client.statuses(1.0)
         return 130
-    except TimeoutError as exc:
-        print(f"Calibration timed out: {exc}", file=sys.stderr)
-        client.send(ACTION_CANCEL, client.current_stage)
+    except (TimeoutError, RuntimeError, serial.SerialException) as exc:
+        print(f"Calibration stopped: {exc}", file=sys.stderr)
+        if client.current_stage not in (STAGE_COMPLETE, STAGE_FAILED, STAGE_CANCELLED):
+            client.send(ACTION_CANCEL, client.current_stage)
         return 1
     finally:
         port.close()

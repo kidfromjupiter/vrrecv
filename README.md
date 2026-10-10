@@ -61,6 +61,49 @@ tool asks for Enter before each capture and allows magnetometer capture to end
 after 10 seconds; otherwise it runs for 30 seconds. Ctrl-C cancels without
 replacing a previously saved calibration.
 
+### Learned sensor axes
+
+Build and flash **both** controller and receiver firmware and use the updated
+`calibrate_controller.py`; calibration commands/status now use protocol v2.
+Orientation samples, the USB envelope, and magnitude diagnostics keep their
+existing formats/versions. Old calibration tools cannot start the new wizard.
+
+Body directions are **+X right, +Y front, +Z top**, a right-handed frame.
+The first six poses now refer to these physical controller directions, not to
+MPU package markings. The wizard determines a signed MPU axis permutation and
+native accelerometer offsets/scales from the opposite faces. That same MPU
+map applies to both acceleration and gyro. Gyro bias is measured while still;
+gyro scale remains the nominal sensitivity.
+
+After figure-eight magnetometer calibration, follow eight stationary holds:
+right/front/top, left/front/top, right/back/top, left/back/top,
+right/front/bottom, left/front/bottom, right/back/bottom, and left/back/bottom.
+Point each indicated corner upward so its three directions point equally
+upward. No precise heading is required; vary the front's compass direction
+between holds while staying near the same location. Each hold gathers 100
+fresh paired readings, with a five-second limit and a short settling delay.
+
+The alignment solver compares all 24 proper signed magnetometer maps using
+the consistency of the normalized gravity–magnetic-field dot product. Poor
+or ambiguous alignment fails calibration and leaves the previous value active.
+Movement, incorrect poses, magnetic overflow, and insufficient samples also
+abort without replacing saved calibration. The host prints both saved maps
+as `body <- sensor` assignments when the wizard succeeds.
+
+NVS v2 stores both maps and a learned-map flag together with the coefficients.
+A valid v1 record remains usable with the configured fallback maps until the
+new wizard succeeds. Those maps are explicitly labeled legacy. Native offsets
+and scales are applied before mapping, exactly once. Only per-axis scaling
+and mounting at 90-degree increments are supported; arbitrary rotation
+matrices and full soft-iron compensation are not estimated.
+
+Acceptance limits live in `../vrcontroller/main/tracker_config.h`: face dominance 0.95,
+pose cosine 0.94, accelerometer standard deviation 0.02 g, residual gyro rate
+5 degrees/second, and magnetic standard deviation 1 µT during a hold. The
+magnetometer map score must be at most 0.05, and the runner-up at least
+`max(1.5 * best, best + 0.03)`. These are initial defaults requiring hardware
+validation.
+
 ## Magnetometer calibration quality check
 
 Flash the updated controller and receiver firmware, remove the receiver's
@@ -145,5 +188,26 @@ cc -std=c11 -Wall -Wextra -Werror -DTEST_RECEIVER -Imain \
   tests/test_magnetometer_protocol.c main/magnetometer_protocol.c \
   main/receiver_protocol.c -lm -o /tmp/vrrecv_mag_test
 /tmp/vrrecv_mag_test
+python3 -m unittest discover -s tests -v
+```
+
+### Calibration v2 map reports
+
+Controller calibration packet IDs 2/3 now use version 2; their sizes stay
+8/12 bytes. Packet ID 6 is a 12-byte map report using calibration version 2.
+USB frame type `0x84` carries a slot byte followed by that report, for a
+13-byte payload in the unchanged 31-byte envelope. The report layout and
+new corner-stage/result codes are documented in `../vrcontroller/README.md`.
+The receiver validates reports before pairing/forwarding. The host caches
+reports by slot/request and queries the saved maps again after successful
+calibration, so a missing terminal report can be recovered. Both firmware
+repositories and the host tool must be updated together; ordinary pose and
+magnetometer diagnostic packets stay compatible.
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -DTEST_RECEIVER -Imain \
+  tests/test_calibration_protocol.c main/receiver_protocol.c \
+  -o /tmp/vrrecv_calibration_protocol_test
+/tmp/vrrecv_calibration_protocol_test
 python3 -m unittest discover -s tests -v
 ```
