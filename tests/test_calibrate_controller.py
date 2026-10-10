@@ -170,6 +170,47 @@ class AxisCalibrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'flash both'):
                 MODULE.discover(Client(),1)
 
+    def test_same_wait_stage_rejection_stops_confirmation_retries(self):
+        from unittest.mock import patch
+        for result in (5,6,14):
+            with self.subTest(result=result):
+                client=MODULE.CalibrationClient(None,0,7)
+                status=MODULE.CalibrationStatus(0,21,result,0,0,7,0)
+                with patch.object(client,'send') as send, \
+                        patch.object(client,'statuses',return_value=[status]):
+                    self.assertEqual(client.wait_for_change(21,MODULE.ACTION_CONFIRM),status)
+                    send.assert_called_once_with(MODULE.ACTION_CONFIRM,21)
+
+    def test_rejected_corner_reprompts_and_completes(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        report=MODULE.decode_map_report(self.report_payload())
+        for result in (5,6):
+            with self.subTest(result=result):
+                class Client:
+                    current_stage=0
+                    confirmations=[]
+                    following=iter([
+                        MODULE.CalibrationStatus(0,21,result,0,0,0x1234,0),
+                        MODULE.CalibrationStatus(0,18,1,5,0,0x1234,100),
+                    ])
+                    def wait_for_change(self,stage,action):
+                        if action==MODULE.ACTION_START_FULL:
+                            return MODULE.CalibrationStatus(0,21,0,0,0,0x1234,0)
+                        self.confirmations.append(stage)
+                        return MODULE.CalibrationStatus(0,22,0,0,0,0x1234,0)
+                    def wait_next(self,**kwargs): return next(self.following)
+                    def read_map_report(self): return report
+                client=Client()
+                with patch('builtins.input',return_value='') as confirm, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(MODULE.run_calibration(client),0)
+                self.assertEqual(client.confirmations,[21,21])
+                self.assertEqual(confirm.call_count,2)
+                self.assertIn('Capture rejected:',output.getvalue())
+                self.assertEqual(output.getvalue().count(MODULE.CAPTURE_NAMES[22]),2)
+
 
 if __name__ == "__main__":
     unittest.main()

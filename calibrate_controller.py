@@ -323,7 +323,12 @@ class CalibrationClient:
                     continue
                 if status.stage in (STAGE_FAILED, STAGE_CANCELLED, STAGE_COMPLETE):
                     return status
-                if status.stage != stage:
+                # A rejected capture can return to the same wait stage before
+                # its brief capture status reaches us. Stop retransmitting the
+                # confirmation and ask the user to reposition instead.
+                if status.stage != stage or (
+                    status.stage in WAIT_PROMPTS and status.result in (5, 6, 14)
+                ):
                     return status
         raise TimeoutError("controller did not advance to the next calibration stage")
 
@@ -394,6 +399,12 @@ def run_calibration(client: CalibrationClient) -> int:
             return 1
 
         if status.stage in WAIT_PROMPTS:
+            if status.result in (5, 6, 14):
+                reason = RESULT_NAMES[status.result]
+                print(f"\nCapture rejected: {reason}. Reposition and retry.")
+                if status.stage == STAGE_WAIT_POS_X and status.result in (6, 14):
+                    print("Repeating all six accelerometer faces; their combined fit was invalid.")
+            last_capture_stage = -1
             print(f"\n{WAIT_PROMPTS[status.stage]}")
             input("Press Enter when ready: ")
             status = client.wait_for_change(status.stage, ACTION_CONFIRM)

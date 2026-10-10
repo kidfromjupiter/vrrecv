@@ -86,8 +86,10 @@ fresh paired readings, with a five-second limit and a short settling delay.
 The alignment solver compares all 24 proper signed magnetometer maps using
 the consistency of the normalized gravity–magnetic-field dot product. Poor
 or ambiguous alignment fails calibration and leaves the previous value active.
-Movement, incorrect poses, magnetic overflow, and insufficient samples also
-abort without replacing saved calibration. The host prints both saved maps
+Movement or incorrect accelerometer poses return to the same prompt for a
+manual retry, preserving completed steps. An invalid combined six-face fit
+repeats all six faces. Ctrl-C still cancels. Magnetic overflow, insufficient
+samples, and sensor errors abort without replacing saved calibration. The host prints both saved maps
 as `body <- sensor` assignments when the wizard succeeds.
 
 NVS v2 stores both maps and a learned-map flag together with the coefficients.
