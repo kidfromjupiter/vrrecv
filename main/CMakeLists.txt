@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "vrrecv.c"
         "receiver_protocol.c"
+        "magnetometer_protocol.c"
     INCLUDE_DIRS "."
         REQUIRES
         esp_driver_gpio

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "magnetometer_protocol.h"
+
 #define RECEIVER_SLOT_COUNT 2U
 #define RECEIVER_RIGHT_SLOT 0U
 #define RECEIVER_LEFT_SLOT 1U
@@ -24,6 +26,8 @@
 #define FUSION_LEFT_SLOT 1U
 #define FUSION_CALIBRATION_COMMAND 0x80U
 #define FUSION_CALIBRATION_STATUS 0x81U
+#define FUSION_MAG_COMMAND 0x82U
+#define FUSION_MAG_SAMPLE 0x83U
 #define FUSION_PAYLOAD_CAPACITY 24U
 
 typedef enum {

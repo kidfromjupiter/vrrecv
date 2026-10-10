@@ -38,7 +38,9 @@ typedef struct {
 
 typedef struct {
     uint8_t slot;
+    uint8_t type;
     tracker_calibration_command_t command;
+    mag_command_t mag_command;
 } host_command_t;
 
 static QueueHandle_t receiver_queue;
@@ -122,7 +124,8 @@ static void espnow_receive_cb(const esp_now_recv_info_t *info,
         (data_len == (int)TRACKER_PACKET_SIZE &&
          data[0] == TRACKER_PACKET_ID_QUATERNION) ||
         (data_len == (int)TRACKER_CALIBRATION_STATUS_SIZE &&
-         data[0] == TRACKER_PACKET_ID_CALIBRATION_STATUS);
+         data[0] == TRACKER_PACKET_ID_CALIBRATION_STATUS) ||
+        (data_len == (int)MAG_SAMPLE_SIZE && data[0] == MAG_PACKET_SAMPLE);
     if (!recognized) return;
 
     receiver_event_t event = {.payload_size = (size_t)data_len};
@@ -162,6 +165,15 @@ static void send_synthetic_status(uint8_t slot, uint16_t request_id,
 static void process_host_command(receiver_session_t *session,
                                  const host_command_t *host)
 {
+    if (host->type == FUSION_MAG_COMMAND) {
+        if (host->slot < RECEIVER_SLOT_COUNT && session->sender_assigned[host->slot]) {
+            const uint8_t *mac = session->sender_macs[host->slot];
+            uint8_t packet[MAG_COMMAND_SIZE];
+            mag_command_encode(packet, &host->mag_command);
+            if (ensure_peer(mac)) (void)esp_now_send(mac, packet, sizeof(packet));
+        }
+        return;
+    }
     if (host->slot >= RECEIVER_SLOT_COUNT ||
         !session->sender_assigned[host->slot]) {
         send_synthetic_status(host->slot, host->command.request_id,
@@ -210,6 +222,21 @@ static void process_receiver_event(receiver_session_t *session,
         } else {
             write_usb_frame((uint8_t)slot, event->payload,
                             event->payload_size);
+        }
+        return;
+    }
+
+    if (event->payload_size == MAG_SAMPLE_SIZE) {
+        mag_sample_t sample;
+        if (!mag_sample_decode(event->payload, event->payload_size, &sample)) return;
+        size_t slot;
+        if (!receiver_session_assign_sender(session, event->sender_mac, &slot)) return;
+        (void)ensure_peer(event->sender_mac);
+        if (!diagnostic_mode) {
+            uint8_t payload[1 + MAG_SAMPLE_SIZE];
+            payload[0] = (uint8_t)slot;
+            memcpy(&payload[1], event->payload, MAG_SAMPLE_SIZE);
+            write_usb_frame(FUSION_MAG_SAMPLE, payload, sizeof(payload));
         }
         return;
     }
@@ -278,15 +305,16 @@ static void usb_command_task(void *arg)
         const uint8_t *payload;
         size_t payload_size;
         if (!receiver_decode_usb_frame(frame, &type, &payload, &payload_size) ||
-            type != FUSION_CALIBRATION_COMMAND ||
-            payload_size != 1U + TRACKER_CALIBRATION_COMMAND_SIZE) {
+            payload_size != 1U + TRACKER_CALIBRATION_COMMAND_SIZE ||
+            (type != FUSION_CALIBRATION_COMMAND && type != FUSION_MAG_COMMAND)) {
             continue;
         }
-        host_command_t host = {.slot = payload[0]};
-        if (host.slot < RECEIVER_SLOT_COUNT &&
-            tracker_calibration_command_decode(
-                &payload[1], TRACKER_CALIBRATION_COMMAND_SIZE,
-                &host.command)) {
+        host_command_t host = {.slot = payload[0], .type = type};
+        bool decoded = type == FUSION_MAG_COMMAND
+            ? mag_command_decode(&payload[1], MAG_COMMAND_SIZE, &host.mag_command)
+            : tracker_calibration_command_decode(
+                &payload[1], TRACKER_CALIBRATION_COMMAND_SIZE, &host.command);
+        if (host.slot < RECEIVER_SLOT_COUNT && decoded) {
             if (!diagnostic_mode) {
                 (void)xQueueSend(command_queue, &host, pdMS_TO_TICKS(20));
             }
